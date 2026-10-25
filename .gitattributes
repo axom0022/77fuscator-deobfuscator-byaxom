@@ -1,0 +1,5 @@
+* text=auto eol=lf
+
+bin/* binary linguist-vendored
+samples/*.lua.txt linguist-vendored
+tests/golden/*.txt linguist-vendored
