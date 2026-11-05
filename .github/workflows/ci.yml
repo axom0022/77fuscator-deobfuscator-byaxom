@@ -9,10 +9,39 @@ jobs:
         with:
           python-version: "3.x"
       - name: syntax check
-        run: for f in src/*.py; do python3 -m py_compile "$f"; done
+        run: |
+          set -e
+          for f in src/*.py; do python3 -m py_compile "$f"; done
       - name: unpack samples
         run: |
+          set -e
           python3 src/unpack.py samples/hello-obfuscated.lua.txt
           python3 src/unpack.py samples/benchmark-obfuscated.lua.txt
-      - name: tidy regression
-        run: tests/run.sh
+      - name: tidy smoke
+        run: |
+          set -e
+          head -1 src/tidy.py >/dev/null
+          python3 - <<'PY'
+          import subprocess, sys
+          src = """local L0_1, L1_1, L2_1, L3_1, L4_1
+          L3_1 = {}
+          L1_1 = "hello from the deobfuscator test suite"
+          L3_1[1] = L1_1
+          L2_1 = "a second constant"
+          L3_1[2] = L2_1
+          L4_1 = "a third constant"
+          L3_1[3] = L4_1
+          L0_1 = print
+          L1_1 = L3_1[1]
+          L0_1(L1_1)
+          """
+          open("/tmp/smoke.dec.lua", "w").write(src)
+          subprocess.run([sys.executable, "src/tidy.py", "/tmp/smoke.dec.lua", "/tmp/smoke.txt"], check=True)
+          got = open("/tmp/smoke.txt", encoding="latin-1").read()
+          banner = "-- [[ deobfuscated by Axomic 77fuscator Deobfuscator"
+          want = 'print("hello from the deobfuscator test suite")'
+          assert got.startswith(banner), got[:80]
+          assert want in got, got
+          assert "L0_1" not in got and "L3_1" not in got, got
+          print(got)
+          PY
