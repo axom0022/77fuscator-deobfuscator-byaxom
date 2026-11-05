@@ -44,7 +44,7 @@ def toks(text):
         else:
             got = None
             for size in (3, 2):
-                if text[i:i + size] in ("...", "..=", "..", "==", "~=", "<=", ">=", "::", "//"):
+                if text[i:i + size] in ("...", "..=", "..", "==", "~=", "<=", ">=", "::", "//", "--"):
                     got = text[i:i + size]
                     break
             if got is None:
@@ -66,7 +66,7 @@ def join(items):
             elif prev in "([{.:#":
                 space = False
             elif kind == "p" and text == "(":
-                space = was != "w" or prev in words
+                space = (was != "w" or prev in words) and prev not in ("function", ")", "]")
             elif kind == "p" and text == "[":
                 space = False
             elif kind == "p" and text == "#":
@@ -98,8 +98,8 @@ def split(text):
             prv = t[i - 1][1] if i > 0 else ""
             if nxt == "=" or prv in "=<>~":
                 continue
-            lhs = "".join(x[1] for x in t[:i]).strip()
-            rhs = "".join(x[1] for x in t[i + 1:]).strip()
+            lhs = join(t[:i]).strip()
+            rhs = join(t[i + 1:]).strip()
             return lhs, rhs
     return None
 
@@ -512,6 +512,8 @@ def title(head):
         return t[2][1]
     if len(t) >= 2 and t[0][1] == "function":
         return t[1][1]
+    if len(t) >= 3 and t[0][0] == "w" and t[1][1] == "=" and t[2][1] == "function":
+        return t[0][1]
     return None
 
 
@@ -975,10 +977,20 @@ def scope(lines):
                 node["new"] = "local " + text
             else:
                 decl.append(name)
-        elif kind == "owner":
+        elif kind in ("owner", "inner"):
             node = nodeof[name]
-            if not node["h"].startswith("local "):
-                node["h"] = "local " + node["h"]
+            head = node.get("h")
+            if not head:
+                if kind != "inner":
+                    decl.append(name)
+            elif head.startswith("local "):
+                pass
+            elif head.startswith("function "):
+                node["h"] = "local " + head
+            elif head.find("(") > 0 and toks(head) and toks(head)[0][1] == name:
+                node["h"] = "local function " + name + " " + head[head.find("("):]
+            elif kind != "inner":
+                decl.append(name)
         elif kind not in ("loop", "param", "inner"):
             decl.append(name)
     if decl:
@@ -987,19 +999,60 @@ def scope(lines):
     return lines
 
 
-def rename(lines):
-    mapping = {}
-    count = [0]
+def marks(text):
+    t = toks(text)
+    spot = None
+    for i, (k, v) in enumerate(t):
+        if k == "w" and v == "function":
+            spot = i
+            break
+    kind = {}
+    if spot is None:
+        return kind
+    if spot >= 2 and t[spot - 1][1] == "local":
+        name = spot + 1
+        if name < len(t) and t[name][0] == "w":
+            kind[name] = "f"
+    elif spot >= 1 and t[spot - 1][1] != "=":
+        name = spot + 1
+        while name < len(t) and t[name][0] == "w":
+            kind[name] = "f"
+            if name + 1 < len(t) and t[name + 1][1] == ".":
+                name += 2
+            else:
+                break
+    else:
+        name = spot - 2
+        if name >= 0 and t[name][0] == "w":
+            kind[name] = "f"
+    depth = 0
+    for i in range(spot + 1, len(t)):
+        k, v = t[i]
+        if k == "p" and v in "([{":
+            depth += 1
+        elif k == "p" and v in ")]}":
+            depth -= 1
+        elif k == "w" and depth == 1 and v not in words:
+            kind[i] = "p"
+    return kind
 
-    def fix(text):
+
+def rename(lines):
+    pool = {"v": 0, "p": 0, "f": 0}
+    seen = {}
+
+    def make(name, kind):
+        if name not in seen:
+            pool[kind] += 1
+            seen[name] = kind + str(pool[kind])
+        return seen[name]
+
+    def fix(text, kind={}):
         out = []
         prev = None
-        for k, v in toks(text):
+        for i, (k, v) in enumerate(toks(text)):
             if k == "w" and v[:1] in ("v", "k") and v[1:].isdigit() and prev not in (".", ":"):
-                if v not in mapping:
-                    count[0] += 1
-                    mapping[v] = "v%d" % count[0]
-                out.append(("w", mapping[v]))
+                out.append(("w", make(v, kind.get(i, "v"))))
             else:
                 out.append((k, v))
             prev = v if k == "p" else None
@@ -1008,7 +1061,8 @@ def rename(lines):
     def go(lst):
         for node in lst:
             if node["k"] == "ln":
-                node["new"] = fix(node.get("new", node["s"]))
+                text = node.get("new", node["s"])
+                node["new"] = fix(text, marks(text))
             elif node["k"] == "if":
                 node["c"] = fix(node["c"])
                 go(node["b"])
@@ -1027,7 +1081,7 @@ def rename(lines):
                 node["h"] = fix(node["h"])
                 go(node["b"])
             elif node["k"] == "func":
-                node["h"] = fix(node["h"])
+                node["h"] = fix(node["h"], marks(node["h"]))
                 go(node["b"])
             else:
                 go(node["b"])
@@ -1050,6 +1104,25 @@ def pairs(text):
 def ops(v):
     return v in ("+", "-", "*", "/", "%", "^", "==", "~=", "<", ">", "<=", ">=",
                  "and", "or", "not", "#")
+
+
+press = {"or": 1, "and": 2, "==": 3, "~=": 3, "<": 3, ">": 3, "<=": 3, ">=": 3,
+         "..": 4, "+": 5, "-": 5, "*": 6, "/": 6, "%": 6, "^": 8}
+
+
+def weight(items):
+    deep = 0
+    low = 9
+    for k, v in items:
+        if k == "p" and v in "([{":
+            deep += 1
+        elif k == "p" and v in ")]}":
+            deep -= 1
+        elif deep == 0 and k == "p" and v in press:
+            low = min(low, press[v])
+        elif deep == 0 and k == "w" and v in press:
+            low = min(low, press[v])
+    return low
 
 
 def deparen(text, whole):
@@ -1154,16 +1227,27 @@ def deparen(text, whole):
         v2 = t[ni][1]
         return v2 in (",", ")", "}", "]")
 
+    def cuts(open, close, pi, ni):
+        low = weight(t[open + 1:close])
+        for spot in (pi, ni):
+            if spot is None:
+                continue
+            k, v = t[spot]
+            if (k == "p" or k == "w") and v in press and press[v] >= low:
+                return True
+        return False
+
     drop = set()
     for open, close in match.items():
         pi = behind(open - 1)
         ni = ahead(close + 1)
-        if prior(pi) and after(ni) and (ctx(pi, ni) or not truncates(open, close, pi, ni)):
+        if (prior(pi) and after(ni) and (ctx(pi, ni) or not truncates(open, close, pi, ni))
+                and not cuts(open, close, pi, ni)):
             drop.add(open)
             drop.add(close)
     if not drop:
         return text
-    return "".join(v for i, (k, v) in enumerate(t) if i not in drop)
+    return join([(k, v) for i, (k, v) in enumerate(t) if i not in drop])
 
 
 def step(header):
@@ -1214,17 +1298,48 @@ def finish(lines):
     return lines
 
 
+def noted(text):
+    for k, v in toks(text):
+        if k == "p" and v == "--":
+            return True
+    return False
+
+
+def depthof(text):
+    deep = 0
+    for k, v in toks(text):
+        if k == "p" and v in "([{":
+            deep += 1
+        elif k == "p" and v in ")]}":
+            deep -= 1
+    return deep
+
+
+def gather(lines, pos):
+    text = lines[pos[0]].replace("\r", "").strip()
+    pos[0] += 1
+    deep = depthof(text)
+    while deep > 0 and pos[0] < len(lines):
+        text = text + " " + lines[pos[0]].replace("\r", "").strip()
+        deep += depthof(lines[pos[0]])
+        pos[0] += 1
+    return text
+
+
 def parse(lines):
     pos = [0]
 
     def blk(stops):
         out = []
         while pos[0] < len(lines):
-            text = lines[pos[0]].strip()
+            text = lines[pos[0]].replace("\r", "").strip()
             first = text.split(" ")[0] if text else ""
             if text == "":
                 pos[0] += 1
                 continue
+            if depthof(text) > 0:
+                text = gather(lines, pos)
+                pos[0] -= 1
             if text in stops or first in stops:
                 return out
             if text.endswith(" then") and text.startswith("if "):
@@ -1263,8 +1378,10 @@ def parse(lines):
                     node["u"] = lines[pos[0]].strip()[5:].strip()
                     pos[0] += 1
                 out.append(node)
-            elif text.startswith("local function ") or text.startswith("function ") or \
-                    (text.endswith(")") and "function(" in text.replace(" ", "")):
+            elif (text.startswith("local function ") or text.startswith("function ") or
+                  (text.endswith(")") and "function(" in text.replace(" ", ""))) and \
+                    not text.endswith(" end") and " end " not in text and \
+                    not text.startswith("return "):
                 node = {"k": "func", "h": text, "b": []}
                 pos[0] += 1
                 node["b"] = blk({"end"})
@@ -1278,6 +1395,9 @@ def parse(lines):
                 if pos[0] < len(lines):
                     pos[0] += 1
                 out.append(node)
+            elif noted(text):
+                out.append({"k": "ln", "s": text, "raw": True})
+                pos[0] += 1
             else:
                 out.append({"k": "ln", "s": text})
                 pos[0] += 1
@@ -1289,7 +1409,10 @@ def render(lines, depth, out):
     pad = "  " * depth
     for node in lines:
         if node["k"] == "ln":
-            out.append(pad + node.get("new", node["s"]))
+            if node.get("raw"):
+                out.append(pad + node["s"])
+            else:
+                out.append(pad + node.get("new", node["s"]))
         elif node["k"] == "if":
             out.append(pad + "if " + join(toks(node["c"])) + " then")
             render(node["b"], depth + 1, out)
@@ -1339,11 +1462,16 @@ def count(text, name):
 
 
 def put(text, name, value):
+    t = toks(text)
     out = []
     prev = ""
-    for k, v in toks(text):
+    for i, (k, v) in enumerate(t):
         if k == "w" and v == name and prev not in (".", ":"):
-            out.extend(toks(value))
+            after = t[i + 1][1] if i + 1 < len(t) else ""
+            fill = value
+            if after in (".", "[", ":") and not atom(value):
+                fill = wrap(value)
+            out.extend(toks(fill))
             prev = ")"
             continue
         out.append((k, v))
@@ -1574,11 +1702,28 @@ def grind(lines):
     return lines
 
 
+def steady(flat):
+    deep = 0
+    for text in flat:
+        t = toks(text)
+        for i, (k, v) in enumerate(t):
+            if k == "w" and v in ("function", "if", "for", "while", "repeat"):
+                deep += 1
+            elif k == "w" and v in ("end", "until"):
+                deep -= 1
+            elif k == "w" and v == "do" and i == 0:
+                deep += 1
+            if deep < 0:
+                return False
+    return deep == 0
+
+
 def work(lines):
     keep = []
     for text in lines:
         stripped = text.strip()
-        if stripped.startswith("local ") and split(stripped[6:]) is None:
+        if stripped.startswith("local ") and "function" not in stripped and \
+                split(stripped[6:]) is None:
             continue
         keep.append(text)
     tree = parse(keep)
@@ -1600,7 +1745,14 @@ def work(lines):
     render(tree, 0, flat)
     while flat and flat[-1] == "":
         flat.pop()
-    return "\n".join(flat)
+    text = "\n".join(flat)
+    if not steady(flat):
+        clean = []
+        for one in lines:
+            if one.strip():
+                clean.append(one.replace("\r", "").rstrip())
+        return "\n".join(clean)
+    return text
 
 
 def main(argv):
